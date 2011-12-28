@@ -134,7 +134,7 @@ public class ShellBolt implements IBolt {
     			}
 
     		} catch (IOException e) {
-
+				throw new RuntimeException("Error during multilang processing", e);
     		}
     	}
     	
