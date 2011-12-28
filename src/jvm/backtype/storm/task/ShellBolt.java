@@ -52,8 +52,93 @@ public class ShellBolt implements IBolt {
     DataOutputStream _processin;
     BufferedReader _processout;
     OutputCollector _collector;
+    Thread _asynccommands;
     Map<Long, Tuple> _inputs = new HashMap<Long, Tuple>();
     String[] command;
+    JSONObject _obj = new JSONObject();
+    
+    public class commandProcessor extends Thread {
+    	BufferedReader processout;
+    	OutputCollector collector;
+    	
+    	public commandProcessor(BufferedReader processout, OutputCollector collector) {
+    		this.processout = processout;
+    		this.collector = collector;
+    	}
+    	
+    	public void run() {
+    		try {
+    			while(true) {
+    				String line = "";
+    				while(true) {
+    					String subline = processout.readLine();
+    					if(subline==null)
+    						throw new RuntimeException("Pipe to subprocess seems to be broken!");
+    					if(subline.equals("sync")) {
+    						break;
+    					}
+    					if(subline.equals("end")) {
+    						break;
+    					}
+    					if(line.length()!=0) {
+    						line+="\n";
+    					}
+    					line+=subline;
+    				}
+    				
+    				//probably from a end then with nothing between sync
+    				if(line.equals("")) 
+    					continue;
+    				
+    				Map action = (Map) JSONValue.parse(line);
+    				String command = (String) action.get("command");
+    				if(command.equals("ack")) {
+    					Long id = (Long) action.get("id");
+    					Tuple acked = _inputs.remove(id);
+    					if(acked==null) {
+    						throw new RuntimeException("Acked a non-existent or already acked/failed id: " + id);
+    					}
+    					_collector.ack(acked);
+    				} else if (command.equals("fail")) {
+    					Long id = (Long) action.get("id");
+    					Tuple failed = _inputs.remove(id);
+    					if(failed==null) {
+    						throw new RuntimeException("Failed a non-existent or already acked/failed id: " + id);
+    					}
+    					_collector.fail(failed);
+    				} else if (command.equals("log")) {
+    					String msg = (String) action.get("msg");
+    					LOG.info("Shell msg: " + msg);
+    				} else if(command.equals("emit")) {
+    					String stream = (String) action.get("stream");
+    					if(stream==null) stream = Utils.DEFAULT_STREAM_ID;
+    					Long task = (Long) action.get("task");
+    					List<Object> tuple = (List) action.get("tuple");
+    					List<Tuple> anchors = new ArrayList<Tuple>();
+    					Object anchorObj = action.get("anchors");
+    					if(anchorObj!=null) {
+    						if(anchorObj instanceof Long) {
+    							anchorObj = Arrays.asList(anchorObj);
+    						}
+    						for(Object o: (List) anchorObj) {
+    							anchors.add(_inputs.get((Long) o));
+    						}
+    					}
+    					if(task==null) {
+    						List<Integer> outtasks = collector.emit(stream, anchors, tuple);
+    						sendToSubprocess(JSONValue.toJSONString(outtasks));
+    					} else {
+    						collector.emitDirect((int)task.longValue(), stream, anchors, tuple);
+    					}
+    				}
+    			}
+
+    		} catch (IOException e) {
+
+    		}
+    	}
+    	
+    }
     
     public ShellBolt(ShellComponent component) {
         this(component.get_execution_command(), component.get_script());
@@ -85,7 +170,11 @@ public class ShellBolt implements IBolt {
         try {
             initializeSubprocess(context);
             _collector = collector;
-
+            if(isAsynchronous())
+            {
+            	_asynccommands = new commandProcessor(_processout, _collector);
+            	_asynccommands.start();
+            }
             sendToSubprocess(JSONValue.toJSONString(stormConf));
             sendToSubprocess(context.toJSONString());
         } catch (IOException e) {
@@ -98,76 +187,79 @@ public class ShellBolt implements IBolt {
         long genId = MessageId.generateId();
         _inputs.put(genId, input);
         try {
-            JSONObject obj = new JSONObject();
-            obj.put("id", genId);
-            obj.put("comp", input.getSourceComponent());
-            obj.put("stream", input.getSourceStreamId());
-            obj.put("task", input.getSourceTask());
-            obj.put("tuple", input.getValues());
-            sendToSubprocess(obj.toString());
-            while(true) {
-              String line = "";
-              while(true) {
-                  String subline = _processout.readLine();
-                  if(subline==null)
-                      throw new RuntimeException("Pipe to subprocess seems to be broken!");
-                  if(subline.equals("sync")) {
-                      line = subline;
-                      break;
-                  }
-                  if(subline.equals("end")) {
-                      break;
-                  }
-                  if(line.length()!=0) {
-                      line+="\n";
-                  }
-                  line+=subline;
-              }
-              if(line.equals("sync")) {
-                  break;
-              } else {
-                  Map action = (Map) JSONValue.parse(line);
-                  String command = (String) action.get("command");
-                  if(command.equals("ack")) {
-                    Long id = (Long) action.get("id");
-                    Tuple acked = _inputs.remove(id);
-                    if(acked==null) {
-                        throw new RuntimeException("Acked a non-existent or already acked/failed id: " + id);
-                    }
-                    _collector.ack(acked);
-                  } else if (command.equals("fail")) {
-                    Long id = (Long) action.get("id");
-                    Tuple failed = _inputs.remove(id);
-                    if(failed==null) {
-                        throw new RuntimeException("Failed a non-existent or already acked/failed id: " + id);
-                    }
-                    _collector.fail(failed);
-                  } else if (command.equals("log")) {
-                    String msg = (String) action.get("msg");
-                    LOG.info("Shell msg: " + msg);
-                  } else if(command.equals("emit")) {
-                    String stream = (String) action.get("stream");
-                    if(stream==null) stream = Utils.DEFAULT_STREAM_ID;
-                    Long task = (Long) action.get("task");
-                    List<Object> tuple = (List) action.get("tuple");
-                    List<Tuple> anchors = new ArrayList<Tuple>();
-                    Object anchorObj = action.get("anchors");
-                    if(anchorObj!=null) {
-                        if(anchorObj instanceof Long) {
-                            anchorObj = Arrays.asList(anchorObj);
-                        }
-                        for(Object o: (List) anchorObj) {
-                            anchors.add(_inputs.get((Long) o));
-                        }
-                    }
-                    if(task==null) {
-                       List<Integer> outtasks = _collector.emit(stream, anchors, tuple);
-                       sendToSubprocess(JSONValue.toJSONString(outtasks));
-                    } else {
-                        _collector.emitDirect((int)task.longValue(), stream, anchors, tuple);
-                    }
-                  }
-              }
+        	_obj.clear();
+            _obj.put("id", genId);
+            _obj.put("comp", input.getSourceComponent());
+            _obj.put("stream", input.getSourceStreamId());
+            _obj.put("task", input.getSourceTask());
+            _obj.put("tuple", input.getValues());
+            sendToSubprocess(_obj.toString());
+            if(!isAsynchronous())
+            {
+            	while(true) {
+            		String line = "";
+            		while(true) {
+            			String subline = _processout.readLine();
+            			if(subline==null)
+            				throw new RuntimeException("Pipe to subprocess seems to be broken!");
+            			if(subline.equals("sync")) {
+            				line = subline;
+            				break;
+            			}
+            			if(subline.equals("end")) {
+            				break;
+            			}
+            			if(line.length()!=0) {
+            				line+="\n";
+            			}
+            			line+=subline;
+            		}
+            		if(line.equals("sync")) {
+            			break;
+            		} else {
+            			Map action = (Map) JSONValue.parse(line);
+            			String command = (String) action.get("command");
+            			if(command.equals("ack")) {
+            				Long id = (Long) action.get("id");
+            				Tuple acked = _inputs.remove(id);
+            				if(acked==null) {
+            					throw new RuntimeException("Acked a non-existent or already acked/failed id: " + id);
+            				}
+            				_collector.ack(acked);
+            			} else if (command.equals("fail")) {
+            				Long id = (Long) action.get("id");
+            				Tuple failed = _inputs.remove(id);
+            				if(failed==null) {
+            					throw new RuntimeException("Failed a non-existent or already acked/failed id: " + id);
+            				}
+            				_collector.fail(failed);
+            			} else if (command.equals("log")) {
+            				String msg = (String) action.get("msg");
+            				LOG.info("Shell msg: " + msg);
+            			} else if(command.equals("emit")) {
+            				String stream = (String) action.get("stream");
+            				if(stream==null) stream = Utils.DEFAULT_STREAM_ID;
+            				Long task = (Long) action.get("task");
+            				List<Object> tuple = (List) action.get("tuple");
+            				List<Tuple> anchors = new ArrayList<Tuple>();
+            				Object anchorObj = action.get("anchors");
+            				if(anchorObj!=null) {
+            					if(anchorObj instanceof Long) {
+            						anchorObj = Arrays.asList(anchorObj);
+            					}
+            					for(Object o: (List) anchorObj) {
+            						anchors.add(_inputs.get((Long) o));
+            					}
+            				}
+            				if(task==null) {
+            					List<Integer> outtasks = _collector.emit(stream, anchors, tuple);
+            					sendToSubprocess(JSONValue.toJSONString(outtasks));
+            				} else {
+            					_collector.emitDirect((int)task.longValue(), stream, anchors, tuple);
+            				}
+            			}
+            		}
+            	}
             }
         } catch(IOException e) {
             throw new RuntimeException("Error during multilang processing", e);
@@ -186,6 +278,10 @@ public class ShellBolt implements IBolt {
         _processin.writeBytes(str + "\n");
         _processin.writeBytes("end\n");
         _processin.flush();
+    }
+    
+    private boolean isAsynchronous() {
+    	return true;
     }
 
 }
