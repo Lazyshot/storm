@@ -281,7 +281,7 @@ public class ShellBolt implements IBolt {
     }
     
     private boolean isAsynchronous() {
-    	return true;
+    	return false;
     }
 
 }
