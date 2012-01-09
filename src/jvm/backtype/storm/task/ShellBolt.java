@@ -280,7 +280,8 @@ public class ShellBolt implements IBolt {
         _processin.flush();
     }
     
-    private boolean isAsynchronous() {
+    public boolean isAsynchronous()
+    {
     	return false;
     }
 
